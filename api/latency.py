@@ -1,44 +1,52 @@
+# api/latency.py
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import json
+from pydantic import BaseModel
+from statistics import fmean
 from pathlib import Path
-import numpy as np
+import json, math
 
 app = FastAPI()
 
-# Allow CORS for POST
+# CORS: allow POST + OPTIONS (preflight) from any origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST"],
+    allow_credentials=False,
+    allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
+# Load telemetry at cold start, fail early if missing
+DATA_PATH = Path(__file__).resolve().with_name("q-vercel-latency.json")
+with DATA_PATH.open("r") as f:
+    TELEMETRY = json.load(f)
+
+class Payload(BaseModel):
+    regions: list[str]
+    threshold_ms: int
+
+def p95(values: list[float]) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    # 95th percentile index (ceil), zero-based, clamped
+    k = max(0, min(len(s) - 1, math.ceil(0.95 * len(s)) - 1))
+    return float(s[k])
+
 @app.post("/")
-async def latency(request: Request):
-    body = await request.json()
-    regions = body.get("regions", [])
-    threshold_ms = body.get("threshold_ms", 200)
-
-    # Load telemetry data from q-vercel-latency.json
-    data_path = Path(__file__).with_name("q-vercel-latency.json")
-    with open(data_path) as f:
-        telemetry = json.load(f)
-
+async def latency(payload: Payload):
     result = {}
-    for region in regions:
-        values = [r for r in telemetry if r["region"] == region]
-        if not values:
+    for region in payload.regions:
+        rows = [r for r in TELEMETRY if r.get("region") == region]
+        if not rows:
             continue
-        latencies = [r["latency_ms"] for r in values]
-        uptimes = [r["uptime"] for r in values]
-        breaches = sum(1 for l in latencies if l > threshold_ms)
-
+        latencies = [float(r["latency_ms"]) for r in rows if "latency_ms" in r]
+        uptimes   = [float(r["uptime"])     for r in rows if "uptime"     in r]
         result[region] = {
-            "avg_latency": float(np.mean(latencies)),
-            "p95_latency": float(np.percentile(latencies, 95)),
-            "avg_uptime": float(np.mean(uptimes)),
-            "breaches": breaches,
+            "avg_latency": round(fmean(latencies), 2),
+            "p95_latency": p95(latencies),
+            "avg_uptime": round(fmean(uptimes), 4) if uptimes else None,
+            "breaches": int(sum(1 for x in latencies if x > payload.threshold_ms)),
         }
-
     return result
